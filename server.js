@@ -1,17 +1,18 @@
 /**
- * Ski Scrapers — Railway-hosted Instagram + YouTube extractor.
+ * Ski Scrapers â€” Railway-hosted Instagram extractor.
  *
  * Why this exists:
- *   Instagram and YouTube block Vercel's IPs (because so many people scrape
- *   from there). Railway IPs are less abused, so they get through. This
- *   service runs the scraping work and is called from the Vercel website.
+ *   Instagram blocks Vercel's IPs. Railway IPs are less abused, so they
+ *   get through. This service runs the scraping work and is called from
+ *   the Vercel website.
  *
  * Endpoints:
- *   POST /instagram { url }   →  { type, kind, media, cover, title, author }
- *   POST /youtube   { url }   →  { type, videoId, title, video, audio, ... }
+ *   POST /instagram { url }   â†’  { type, kind, media, cover, title, author }
  *
  * TikTok is handled by a separate Railway service (the one already running
- * for face-swap / tiktok). This service does NOT duplicate it.
+ * for face-swap / tiktok). YouTube extraction was dropped â€” both yt-dlp
+ * cookie auth and player-client tricks fail on cloud IPs in the current
+ * YouTube anti-bot regime. Add back if/when residential proxies are wired.
  *
  * Auth:
  *   Every request must include `x-api-key: <SCRAPER_API_KEY>` matching the
@@ -19,7 +20,6 @@
  */
 
 import express from "express";
-import ytdl from "@distube/ytdl-core";
 import youtubedl from "youtube-dl-exec";
 
 const PORT = Number(process.env.PORT) || 8080;
@@ -74,7 +74,7 @@ app.post("/instagram", requireApiKey, async (req, res) => {
   const shortcode = url.match(IG_RE)[1];
   const isReel = /\/(reel|reels|tv)\//i.test(url);
 
-  // yt-dlp first — it has a native Instagram extractor with multiple
+  // yt-dlp first â€” it has a native Instagram extractor with multiple
   // fallback strategies (mobile API, embed page, public profile API).
   const fromYtDlp = await tryYtDlpInstagram(url);
   if (fromYtDlp) return res.json(fromYtDlp);
@@ -317,148 +317,9 @@ function parseIGHtml(html) {
   return found.video || found.image ? found : null;
 }
 
-// ---- YouTube --------------------------------------------------------- //
-
-const YT_RE =
-  /(?:youtube\.com\/(?:watch\?v=|shorts\/|embed\/|v\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/i;
-
-app.post("/youtube", requireApiKey, async (req, res) => {
-  const url = String(req.body?.url || "").trim();
-  if (!url) return res.status(400).json({ error: "Missing url" });
-  const m = url.match(YT_RE);
-  if (!m) return res.status(400).json({ error: "Not a YouTube URL" });
-  const videoId = m[1];
-  const canonical = `https://www.youtube.com/watch?v=${videoId}`;
-
-  // Try yt-dlp first — it's massively more reliable than ytdl-core for
-  // platforms that block cloud IPs (uses multiple player-extraction
-  // strategies, web/android/ios clients, auto-rotates around blocks).
-  const ytDlpOut = await tryYtDlp(canonical);
-  if (ytDlpOut) return res.json({ ...ytDlpOut, videoId });
-
-  // Last resort: ytdl-core (lighter, but breaks more often).
-  try {
-    const info = await ytdl.getInfo(canonical, {
-      requestOptions: { headers: { "User-Agent": CHROME_UA } },
-    });
-    const details = info.videoDetails;
-    const muxed = info.formats
-      .filter((f) => f.hasVideo && f.hasAudio && f.container === "mp4")
-      .sort((a, b) => (Number(b.height) || 0) - (Number(a.height) || 0));
-    const videoOnly = info.formats
-      .filter((f) => f.hasVideo && !f.hasAudio && f.container === "mp4")
-      .sort((a, b) => (Number(b.height) || 0) - (Number(a.height) || 0));
-    const audioOnly = info.formats
-      .filter((f) => !f.hasVideo && f.hasAudio)
-      .sort((a, b) => (Number(b.audioBitrate) || 0) - (Number(a.audioBitrate) || 0));
-    const bestMuxed = muxed[0];
-    const bestAudio = audioOnly[0];
-    const highRes = videoOnly[0];
-
-    return res.json({
-      type: "youtube",
-      videoId,
-      title: details.title,
-      author: details.author?.name || details.ownerChannelName || "",
-      thumbnail:
-        details.thumbnails?.[details.thumbnails.length - 1]?.url ||
-        `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
-      duration: Number(details.lengthSeconds) || 0,
-      video: bestMuxed?.url || null,
-      videoQuality: bestMuxed?.qualityLabel || null,
-      videoHires: highRes?.url || null,
-      videoHiresQuality: highRes?.qualityLabel || null,
-      audio: bestAudio?.url || null,
-      audioBitrate: bestAudio?.audioBitrate || null,
-    });
-  } catch (err) {
-    const msg = err?.message || String(err);
-    if (/Video unavailable|Sign in to confirm|Private video/i.test(msg)) {
-      return res
-        .status(502)
-        .json({ error: "Video is private, age-restricted, or region-blocked." });
-    }
-    console.error("[youtube] both extractors failed:", msg);
-    return res
-      .status(502)
-      .json({ error: "Couldn't fetch that video — YouTube is blocking from this region. Try a different video." });
-  }
-});
-
-/** yt-dlp wrapper — much more robust against YouTube/Instagram blocks
- *  than ytdl-core. yt-dlp is the same engine the rest of the open-source
- *  world relies on and is updated weekly.
- *
- *  Performance:
- *    yt-dlp's default behaviour does extensive retries with backoff. On
- *    cloud IPs where some clients are blocked, each "blocked" attempt
- *    burned 5-10 sec before failing. We cap retries + socket timeout so
- *    a single failing client returns fast, then move to the next. */
-async function tryYtDlp(url) {
-  // Pass ALL the alt YouTube clients to yt-dlp in ONE call — yt-dlp
-  // internally tries them and returns whichever has the most formats.
-  // Much faster than spawning multiple Python processes from Node.
-  try {
-    const meta = await youtubedl(url, {
-      dumpSingleJson: true,
-      noWarnings: true,
-      noCheckCertificates: true,
-      preferFreeFormats: true,
-      socketTimeout: 8,                   // 8 sec per socket op
-      retries: 1,                          // don't retry forever
-      fragmentRetries: 1,
-      // Order matters — first-successful wins inside yt-dlp.
-      extractorArgs:
-        "youtube:player_client=mweb,ios,android_vr,tv_embedded",
-      addHeader: ["referer:youtube.com", `user-agent:${CHROME_UA}`],
-    });
-    const out = formatYtDlpMeta(meta);
-    if (out && (out.video || out.audio)) return out;
-    return null;
-  } catch (e) {
-    const err = e?.stderr?.toString().slice(0, 240) || e?.message || String(e);
-    console.error("[yt-dlp] failed:", err.slice(0, 240));
-    return null;
-  }
-}
-
-function formatYtDlpMeta(meta) {
-  if (!meta) return null;
-  try {
-    const formats = Array.isArray(meta.formats) ? meta.formats : [];
-    const muxed = formats
-      .filter((f) => f.ext === "mp4" && f.acodec !== "none" && f.vcodec !== "none")
-      .sort((a, b) => (b.height || 0) - (a.height || 0));
-    const videoOnly = formats
-      .filter((f) => f.ext === "mp4" && f.acodec === "none" && f.vcodec !== "none")
-      .sort((a, b) => (b.height || 0) - (a.height || 0));
-    const audioOnly = formats
-      .filter((f) => f.acodec !== "none" && f.vcodec === "none")
-      .sort((a, b) => (b.abr || 0) - (a.abr || 0));
-    const bestMuxed = muxed[0];
-    const highRes = videoOnly[0];
-    const bestAudio = audioOnly[0];
-    return {
-      type: "youtube",
-      title: meta.title || "",
-      author: meta.uploader || meta.channel || "",
-      thumbnail: meta.thumbnail || "",
-      duration: Number(meta.duration) || 0,
-      video: bestMuxed?.url || null,
-      videoQuality: bestMuxed?.format_note || (bestMuxed ? `${bestMuxed.height}p` : null),
-      videoHires: highRes?.url || null,
-      videoHiresQuality: highRes?.format_note || (highRes ? `${highRes.height}p` : null),
-      audio: bestAudio?.url || null,
-      audioBitrate: bestAudio?.abr ? Math.round(bestAudio.abr) : null,
-    };
-  } catch (e) {
-    console.error("[yt-dlp format] failed:", e?.message || e);
-    return null;
-  }
-}
 
 // NOTE: TikTok is handled by a separate Railway service the user already
-// runs. Don't duplicate it here — that scraper service stays in charge of
+// runs. Don't duplicate it here â€” that scraper service stays in charge of
 // TikTok. The Vercel /api/tiktok route either calls tikwm.com directly
 // (default) or can be repointed at the existing service if needed.
 
@@ -488,5 +349,5 @@ function decode(s) {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`[ski-scrapers] listening on :${PORT}`);
-  if (!API_KEY) console.warn("[ski-scrapers] WARN: SCRAPER_API_KEY not set — service refusing requests");
+  if (!API_KEY) console.warn("[ski-scrapers] WARN: SCRAPER_API_KEY not set â€” service refusing requests");
 });

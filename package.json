@@ -12,7 +12,6 @@
     "node": "20.x"
   },
   "dependencies": {
-    "@distube/ytdl-core": "^4.16.4",
     "express": "^4.21.0",
     "youtube-dl-exec": "^3.1.7"
   }
