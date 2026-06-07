@@ -387,16 +387,45 @@ app.post("/youtube", requireApiKey, async (req, res) => {
  *  than ytdl-core. yt-dlp is the same engine the rest of the open-source
  *  world relies on and is updated weekly. */
 async function tryYtDlp(url) {
+  // YouTube's `web` client is heavily protected on cloud IPs — gets the
+  // "Sign in to confirm you're not a bot" wall. These alt clients use
+  // different signing and aren't blocked from datacenter IPs as aggressively.
+  // We try several in order and use whichever returns formats first.
+  const playerClients = [
+    "mweb",                  // mobile web — usually works
+    "ios",                   // iOS app client
+    "android_vr",            // VR client — almost never blocked
+    "tv_embedded",           // embedded TV player
+    "web_safari",            // Safari user-agent web client
+  ];
+
+  for (const client of playerClients) {
+    try {
+      const meta = await youtubedl(url, {
+        dumpSingleJson: true,
+        noWarnings: true,
+        noCheckCertificates: true,
+        preferFreeFormats: true,
+        extractorArgs: `youtube:player_client=${client}`,
+        addHeader: ["referer:youtube.com", `user-agent:${CHROME_UA}`],
+      });
+      const out = formatYtDlpMeta(meta);
+      if (out && (out.video || out.audio)) {
+        console.log(`[yt-dlp] success via ${client}`);
+        return out;
+      }
+    } catch (e) {
+      const err = e?.stderr?.toString().slice(0, 200) || e?.message || String(e);
+      console.warn(`[yt-dlp] ${client} failed:`, err.slice(0, 160));
+      // Try the next client.
+    }
+  }
+  return null;
+}
+
+function formatYtDlpMeta(meta) {
+  if (!meta) return null;
   try {
-    // -J = dump single video JSON (no download).
-    // --no-check-certificate + UA matches what works around most blocks.
-    const meta = await youtubedl(url, {
-      dumpSingleJson: true,
-      noWarnings: true,
-      noCheckCertificates: true,
-      preferFreeFormats: true,
-      addHeader: ["referer:youtube.com", `user-agent:${CHROME_UA}`],
-    });
     const formats = Array.isArray(meta.formats) ? meta.formats : [];
     const muxed = formats
       .filter((f) => f.ext === "mp4" && f.acodec !== "none" && f.vcodec !== "none")
@@ -424,7 +453,7 @@ async function tryYtDlp(url) {
       audioBitrate: bestAudio?.abr ? Math.round(bestAudio.abr) : null,
     };
   } catch (e) {
-    console.error("[yt-dlp] failed:", e?.stderr?.slice(0, 200) || e?.message || e);
+    console.error("[yt-dlp format] failed:", e?.message || e);
     return null;
   }
 }
