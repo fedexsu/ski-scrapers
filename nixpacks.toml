@@ -1,0 +1,15 @@
+# Tell Railway's Nixpacks builder to install Python alongside Node.
+# `youtube-dl-exec` shells out to the yt-dlp Python script at runtime,
+# so Python has to be on PATH inside the container.
+#
+# We also pin Node 20 explicitly so future Node 24 betas (where some npm
+# behaviour changed) don't trip us up.
+
+[phases.setup]
+nixPkgs = ['nodejs_20', 'python311']
+
+[phases.install]
+cmds = ['npm ci --omit=dev']
+
+[start]
+cmd = 'node server.js'

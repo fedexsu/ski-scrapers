@@ -9,7 +9,7 @@
     "dev": "node --watch server.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": "20.x"
   },
   "dependencies": {
     "@distube/ytdl-core": "^4.16.4",
