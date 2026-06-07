@@ -122,6 +122,8 @@ async function tryYtDlpInstagram(url) {
       dumpSingleJson: true,
       noWarnings: true,
       noCheckCertificates: true,
+      socketTimeout: 8,
+      retries: 1,
       addHeader: ["referer:instagram.com", `user-agent:${IPHONE_UA}`],
     });
     // yt-dlp returns either a single video or a "playlist" for carousels.
@@ -385,42 +387,39 @@ app.post("/youtube", requireApiKey, async (req, res) => {
 
 /** yt-dlp wrapper — much more robust against YouTube/Instagram blocks
  *  than ytdl-core. yt-dlp is the same engine the rest of the open-source
- *  world relies on and is updated weekly. */
+ *  world relies on and is updated weekly.
+ *
+ *  Performance:
+ *    yt-dlp's default behaviour does extensive retries with backoff. On
+ *    cloud IPs where some clients are blocked, each "blocked" attempt
+ *    burned 5-10 sec before failing. We cap retries + socket timeout so
+ *    a single failing client returns fast, then move to the next. */
 async function tryYtDlp(url) {
-  // YouTube's `web` client is heavily protected on cloud IPs — gets the
-  // "Sign in to confirm you're not a bot" wall. These alt clients use
-  // different signing and aren't blocked from datacenter IPs as aggressively.
-  // We try several in order and use whichever returns formats first.
-  const playerClients = [
-    "mweb",                  // mobile web — usually works
-    "ios",                   // iOS app client
-    "android_vr",            // VR client — almost never blocked
-    "tv_embedded",           // embedded TV player
-    "web_safari",            // Safari user-agent web client
-  ];
-
-  for (const client of playerClients) {
-    try {
-      const meta = await youtubedl(url, {
-        dumpSingleJson: true,
-        noWarnings: true,
-        noCheckCertificates: true,
-        preferFreeFormats: true,
-        extractorArgs: `youtube:player_client=${client}`,
-        addHeader: ["referer:youtube.com", `user-agent:${CHROME_UA}`],
-      });
-      const out = formatYtDlpMeta(meta);
-      if (out && (out.video || out.audio)) {
-        console.log(`[yt-dlp] success via ${client}`);
-        return out;
-      }
-    } catch (e) {
-      const err = e?.stderr?.toString().slice(0, 200) || e?.message || String(e);
-      console.warn(`[yt-dlp] ${client} failed:`, err.slice(0, 160));
-      // Try the next client.
-    }
+  // Pass ALL the alt YouTube clients to yt-dlp in ONE call — yt-dlp
+  // internally tries them and returns whichever has the most formats.
+  // Much faster than spawning multiple Python processes from Node.
+  try {
+    const meta = await youtubedl(url, {
+      dumpSingleJson: true,
+      noWarnings: true,
+      noCheckCertificates: true,
+      preferFreeFormats: true,
+      socketTimeout: 8,                   // 8 sec per socket op
+      retries: 1,                          // don't retry forever
+      fragmentRetries: 1,
+      // Order matters — first-successful wins inside yt-dlp.
+      extractorArgs:
+        "youtube:player_client=mweb,ios,android_vr,tv_embedded",
+      addHeader: ["referer:youtube.com", `user-agent:${CHROME_UA}`],
+    });
+    const out = formatYtDlpMeta(meta);
+    if (out && (out.video || out.audio)) return out;
+    return null;
+  } catch (e) {
+    const err = e?.stderr?.toString().slice(0, 240) || e?.message || String(e);
+    console.error("[yt-dlp] failed:", err.slice(0, 240));
+    return null;
   }
-  return null;
 }
 
 function formatYtDlpMeta(meta) {
