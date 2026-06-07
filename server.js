@@ -20,6 +20,7 @@
 
 import express from "express";
 import ytdl from "@distube/ytdl-core";
+import youtubedl from "youtube-dl-exec";
 
 const PORT = Number(process.env.PORT) || 8080;
 const API_KEY = process.env.SCRAPER_API_KEY || "";
@@ -73,6 +74,12 @@ app.post("/instagram", requireApiKey, async (req, res) => {
   const shortcode = url.match(IG_RE)[1];
   const isReel = /\/(reel|reels|tv)\//i.test(url);
 
+  // yt-dlp first — it has a native Instagram extractor with multiple
+  // fallback strategies (mobile API, embed page, public profile API).
+  const fromYtDlp = await tryYtDlpInstagram(url);
+  if (fromYtDlp) return res.json(fromYtDlp);
+
+  // Mirror sites as fallback when yt-dlp is rate-limited.
   const racers = [
     trySnapinsta(url),
     trySnapsave(url),
@@ -105,9 +112,36 @@ app.post("/instagram", requireApiKey, async (req, res) => {
 
   return res.status(502).json({
     error:
-      "All Instagram extractors failed. Either the post is private, the mirror sites are temporarily down, or Instagram is rate-limiting.",
+      "Instagram is blocking us right now. Try a different post, or wait a couple minutes and retry.",
   });
 });
+
+async function tryYtDlpInstagram(url) {
+  try {
+    const meta = await youtubedl(url, {
+      dumpSingleJson: true,
+      noWarnings: true,
+      noCheckCertificates: true,
+      addHeader: ["referer:instagram.com", `user-agent:${IPHONE_UA}`],
+    });
+    // yt-dlp returns either a single video or a "playlist" for carousels.
+    const single = meta.entries?.[0] || meta;
+    const video = single.url || single.formats?.find((f) => f.ext === "mp4")?.url;
+    const image = !video ? single.thumbnail || single.url : null;
+    if (!video && !image) return null;
+    return {
+      type: "instagram",
+      kind: video ? "video" : "image",
+      media: video || image,
+      cover: single.thumbnail || video || image,
+      title: (single.title || single.description || "").replace(/ on Instagram.*$/, "").trim(),
+      author: single.uploader || single.channel || "",
+    };
+  } catch (e) {
+    console.error("[ig yt-dlp] failed:", e?.stderr?.slice(0, 200) || e?.message || e);
+    return null;
+  }
+}
 
 async function trySnapinsta(igUrl) {
   for (const endpoint of [
@@ -294,26 +328,27 @@ app.post("/youtube", requireApiKey, async (req, res) => {
   const videoId = m[1];
   const canonical = `https://www.youtube.com/watch?v=${videoId}`;
 
+  // Try yt-dlp first — it's massively more reliable than ytdl-core for
+  // platforms that block cloud IPs (uses multiple player-extraction
+  // strategies, web/android/ios clients, auto-rotates around blocks).
+  const ytDlpOut = await tryYtDlp(canonical);
+  if (ytDlpOut) return res.json({ ...ytDlpOut, videoId });
+
+  // Last resort: ytdl-core (lighter, but breaks more often).
   try {
     const info = await ytdl.getInfo(canonical, {
-      requestOptions: {
-        headers: { "User-Agent": CHROME_UA },
-      },
+      requestOptions: { headers: { "User-Agent": CHROME_UA } },
     });
     const details = info.videoDetails;
-
     const muxed = info.formats
       .filter((f) => f.hasVideo && f.hasAudio && f.container === "mp4")
       .sort((a, b) => (Number(b.height) || 0) - (Number(a.height) || 0));
-
     const videoOnly = info.formats
       .filter((f) => f.hasVideo && !f.hasAudio && f.container === "mp4")
       .sort((a, b) => (Number(b.height) || 0) - (Number(a.height) || 0));
-
     const audioOnly = info.formats
       .filter((f) => !f.hasVideo && f.hasAudio)
       .sort((a, b) => (Number(b.audioBitrate) || 0) - (Number(a.audioBitrate) || 0));
-
     const bestMuxed = muxed[0];
     const bestAudio = audioOnly[0];
     const highRes = videoOnly[0];
@@ -341,18 +376,58 @@ app.post("/youtube", requireApiKey, async (req, res) => {
         .status(502)
         .json({ error: "Video is private, age-restricted, or region-blocked." });
     }
-    if (/Status code: 410|signature/i.test(msg)) {
-      return res.status(502).json({
-        error:
-          "YouTube updated their signing cipher and our extractor needs a refresh. Update @distube/ytdl-core and redeploy.",
-      });
-    }
-    console.error("[youtube] extract failed:", msg);
+    console.error("[youtube] both extractors failed:", msg);
     return res
       .status(502)
-      .json({ error: "Couldn't fetch that video. YouTube may be rate-limiting." });
+      .json({ error: "Couldn't fetch that video — YouTube is blocking from this region. Try a different video." });
   }
 });
+
+/** yt-dlp wrapper — much more robust against YouTube/Instagram blocks
+ *  than ytdl-core. yt-dlp is the same engine the rest of the open-source
+ *  world relies on and is updated weekly. */
+async function tryYtDlp(url) {
+  try {
+    // -J = dump single video JSON (no download).
+    // --no-check-certificate + UA matches what works around most blocks.
+    const meta = await youtubedl(url, {
+      dumpSingleJson: true,
+      noWarnings: true,
+      noCheckCertificates: true,
+      preferFreeFormats: true,
+      addHeader: ["referer:youtube.com", `user-agent:${CHROME_UA}`],
+    });
+    const formats = Array.isArray(meta.formats) ? meta.formats : [];
+    const muxed = formats
+      .filter((f) => f.ext === "mp4" && f.acodec !== "none" && f.vcodec !== "none")
+      .sort((a, b) => (b.height || 0) - (a.height || 0));
+    const videoOnly = formats
+      .filter((f) => f.ext === "mp4" && f.acodec === "none" && f.vcodec !== "none")
+      .sort((a, b) => (b.height || 0) - (a.height || 0));
+    const audioOnly = formats
+      .filter((f) => f.acodec !== "none" && f.vcodec === "none")
+      .sort((a, b) => (b.abr || 0) - (a.abr || 0));
+    const bestMuxed = muxed[0];
+    const highRes = videoOnly[0];
+    const bestAudio = audioOnly[0];
+    return {
+      type: "youtube",
+      title: meta.title || "",
+      author: meta.uploader || meta.channel || "",
+      thumbnail: meta.thumbnail || "",
+      duration: Number(meta.duration) || 0,
+      video: bestMuxed?.url || null,
+      videoQuality: bestMuxed?.format_note || (bestMuxed ? `${bestMuxed.height}p` : null),
+      videoHires: highRes?.url || null,
+      videoHiresQuality: highRes?.format_note || (highRes ? `${highRes.height}p` : null),
+      audio: bestAudio?.url || null,
+      audioBitrate: bestAudio?.abr ? Math.round(bestAudio.abr) : null,
+    };
+  } catch (e) {
+    console.error("[yt-dlp] failed:", e?.stderr?.slice(0, 200) || e?.message || e);
+    return null;
+  }
+}
 
 // NOTE: TikTok is handled by a separate Railway service the user already
 // runs. Don't duplicate it here — that scraper service stays in charge of
