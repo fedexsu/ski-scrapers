@@ -1,0 +1,18 @@
+{
+  "name": "ski-scrapers",
+  "version": "1.0.0",
+  "description": "Instagram + YouTube + TikTok scraper microservice for Ski Tools. Runs on Railway where IPs aren't blocked by the major platforms.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@distube/ytdl-core": "^4.16.4",
+    "express": "^4.21.0"
+  }
+}
