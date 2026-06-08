@@ -164,6 +164,26 @@ async function tickOnce() {
   }
 }
 
+/** Hit the Vercel expire endpoint to release stale pending orders.
+ *  We run this from Railway because Vercel Hobby plan caps crons at 1/day. */
+async function expireStaleOrders() {
+  if (!configured()) return;
+  const cronSecret = process.env.CRON_SECRET || "";
+  if (!cronSecret) return; // skip silently if not configured
+  try {
+    const r = await fetch(`${SITE_BASE}/api/cron/skipay-expire`, {
+      method: "GET",
+      headers: { authorization: `Bearer ${cronSecret}` },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!r.ok) {
+      console.warn(`[skipay-watcher] expire endpoint returned ${r.status}`);
+    }
+  } catch (err) {
+    console.error("[skipay-watcher] expire call failed:", err?.message || err);
+  }
+}
+
 export function startSkipayWatcher() {
   logSkipayConfigStatus();
   if (!configured()) return;
@@ -173,4 +193,10 @@ export function startSkipayWatcher() {
   setInterval(() => {
     tickOnce().catch((err) => console.error("[skipay-watcher] tick failed:", err));
   }, POLL_MS);
+
+  // Expire stale orders every 5 minutes.
+  expireStaleOrders().catch(() => {});
+  setInterval(() => {
+    expireStaleOrders().catch(() => {});
+  }, 5 * 60 * 1000);
 }
