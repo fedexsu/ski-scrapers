@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Ski Scrapers â€” Railway-hosted Instagram extractor.
  *
  * Why this exists:
@@ -21,6 +21,7 @@
 
 import express from "express";
 import youtubedl from "youtube-dl-exec";
+import { startSkipayWatcher } from "./skipay-watcher.js";
 
 const PORT = Number(process.env.PORT) || 8080;
 const API_KEY = process.env.SCRAPER_API_KEY || "";
@@ -349,5 +350,7 @@ function decode(s) {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`[ski-scrapers] listening on :${PORT}`);
-  if (!API_KEY) console.warn("[ski-scrapers] WARN: SCRAPER_API_KEY not set â€” service refusing requests");
+  if (!API_KEY) console.warn("[ski-scrapers] WARN: SCRAPER_API_KEY not set — service refusing requests");
+  // Background SkiPay blockchain watcher. Idle if env not set.
+  startSkipayWatcher();
 });
