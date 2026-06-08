@@ -1,11 +1,11 @@
 /**
  * SkiPay watcher — polls the Tron blockchain every N seconds for USDT
  * transfers arriving at our master wallet address, then notifies the
- * Vercel /api/skipay/confirm endpoint so it can credit users / mint
+ * Vercel /api/skipay/match endpoint so it can credit users / mint
  * license keys.
  *
  * Stateless across restarts. Idempotency lives on the Vercel side:
- * /api/skipay/confirm uses tx_hash as a unique key and refuses to
+ * /api/skipay/match uses tx_hash as a unique key and refuses to
  * double-credit.
  *
  * Required env vars:
@@ -49,7 +49,7 @@ function logSkipayConfigStatus() {
     return;
   }
   console.log(
-    `[skipay-watcher] watching ${MASTER_ADDR.slice(0, 6)}…${MASTER_ADDR.slice(-4)} every ${POLL_MS}ms; forwarding to ${SITE_BASE}/api/skipay/confirm`,
+    `[skipay-watcher] watching ${MASTER_ADDR.slice(0, 6)}…${MASTER_ADDR.slice(-4)} every ${POLL_MS}ms; forwarding to ${SITE_BASE}/api/skipay/match`,
   );
 }
 
